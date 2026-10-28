@@ -1,0 +1,40 @@
+{
+  "name": "distributed-wagering-processor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "start:dev": "bun --watch src/main.ts",
+    "start:worker": "bun run src/worker.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "test:integration": "docker compose up -d --wait postgres localstack && bun run migration:up && RUN_INTEGRATION_TESTS=1 bun test --timeout=120000 --max-concurrency=1 src/integration",
+    "migration:up": "bun run build && mikro-orm migration:up --config ./dist/infrastructure/persistence/mikro-orm.config.js",
+    "migration:down": "bun run build && mikro-orm migration:down --config ./dist/infrastructure/persistence/mikro-orm.config.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.800.0",
+    "@mikro-orm/core": "^6.4.0",
+    "@mikro-orm/migrations": "^6.4.0",
+    "@mikro-orm/postgresql": "^6.4.0",
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@nestjs/platform-express": "^11.0.0",
+    "decimal.js": "^10.5.0",
+    "pg": "^8.13.0",
+    "pino": "^9.6.0",
+    "prom-client": "^15.1.3",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.0"
+  },
+  "devDependencies": {
+    "@mikro-orm/cli": "^6.4.0",
+    "@types/bun": "^1.2.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.7.0"
+  }
+}
