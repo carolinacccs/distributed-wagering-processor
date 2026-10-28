@@ -23,16 +23,29 @@ export class WalletsController {
       body === null ||
       typeof body !== "object" ||
       typeof (body as Record<string, unknown>).playerId !== "string" ||
-      typeof (body as Record<string, unknown>).currency !== "string"
+      typeof (body as Record<string, unknown>).currency !== "string" ||
+      ((body as Record<string, unknown>).initialBalance !== undefined &&
+        typeof (body as Record<string, unknown>).initialBalance !== "string")
     ) {
       throw new HttpException(
-        { code: "INVALID_PAYLOAD", message: "playerId and currency are required." },
+        {
+          code: "INVALID_PAYLOAD",
+          message: "playerId, currency, and an optional string initialBalance are required.",
+        },
         HttpStatus.BAD_REQUEST,
       );
     }
-    const request = body as { playerId: string; currency: string };
+    const request = body as {
+      playerId: string;
+      currency: string;
+      initialBalance?: string;
+    };
     try {
-      return await this.queries.createWallet(request.playerId, request.currency);
+      return await this.queries.createWallet(
+        request.playerId,
+        request.currency,
+        request.initialBalance,
+      );
     } catch (error) {
       if (error instanceof TypeError) {
         throw new HttpException(

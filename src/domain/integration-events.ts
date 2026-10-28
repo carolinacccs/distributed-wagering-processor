@@ -144,3 +144,27 @@ export class WagerTransactionRejectedEvent extends IntegrationEvent {
     );
   }
 }
+
+export class WalletOpenedEvent extends IntegrationEvent {
+  readonly type = "WALLET_OPENED";
+
+  private constructor(
+    eventId: string,
+    occurredAt: string,
+    transactionId: string,
+    walletId: string,
+    amount: Money,
+  ) {
+    super(eventId, occurredAt, transactionId, walletId, amount);
+  }
+
+  static create(
+    eventId: string,
+    transactionId: string,
+    walletId: string,
+    amount: Money,
+    occurredAt = new Date().toISOString(),
+  ): WalletOpenedEvent {
+    return new WalletOpenedEvent(eventId, occurredAt, transactionId, walletId, amount);
+  }
+}

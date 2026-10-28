@@ -77,7 +77,7 @@ export interface WagerTransactionSession {
     providerId: string,
     externalTransactionId: string,
   ): Promise<WagerReference | null>;
-  hasReversal(referenceId: string): Promise<boolean>;
+  hasReversal(referenceId: string, kind: WagerTransactionKind): Promise<boolean>;
   deferReference(id: string): Promise<{ attempts: number; exhausted: boolean }>;
   saveWallet(wallet: Wallet, expectedVersion: number): Promise<void>;
   updateTransaction(

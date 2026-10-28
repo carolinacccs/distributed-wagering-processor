@@ -75,49 +75,52 @@ describe("wager transaction kind rules", () => {
     expect(wallet.balance.amount).toBe("2.00");
   });
 
-  test("ROLLBACK debits only its referenced REFUND", () => {
+  test("ROLLBACK credits a processed BET", () => {
     const wallet = Wallet.open("wallet-1", "USD");
-    wallet.credit(Money.from("4.00", "USD"));
     const bet = create(WagerTransactionKind.BET, "bet-for-rollback");
     bet.markProcessed();
-    const refund = create(WagerTransactionKind.REFUND, "refund-for-rollback", bet.id);
-    refund.markProcessed();
-    const rollback = create(WagerTransactionKind.ROLLBACK, "rollback-1", refund.id);
-    expect(rollback.directionFor(refund)).toBe(TransactionDirection.DEBIT);
-    rollback.applyTo(wallet, refund);
+    const rollback = create(WagerTransactionKind.ROLLBACK, "rollback-bet", bet.id);
+    expect(rollback.directionFor(bet)).toBe(TransactionDirection.CREDIT);
+    rollback.applyTo(wallet, bet);
     expect(wallet.balance.amount).toBe("2.00");
   });
 
-  test("REVERSAL applies the opposite of the referenced transaction", () => {
+  test("ROLLBACK debits a processed WIN", () => {
     const wallet = Wallet.open("wallet-1", "USD");
-    wallet.credit(Money.from("5.00", "USD"));
-    const win = create(WagerTransactionKind.WIN, "win-1");
-    const reversal = create(WagerTransactionKind.REVERSAL, "reversal-1", win.id);
-    expect(reversal.directionFor(win)).toBe(TransactionDirection.DEBIT);
-    reversal.applyTo(wallet, win);
-    expect(wallet.balance.amount).toBe("3.00");
+    wallet.credit(Money.from("4.00", "USD"));
+    const win = create(WagerTransactionKind.WIN, "win-for-rollback");
+    win.markProcessed();
+    const rollback = create(WagerTransactionKind.ROLLBACK, "rollback-win", win.id);
+    expect(rollback.directionFor(win)).toBe(TransactionDirection.DEBIT);
+    rollback.applyTo(wallet, win);
+    expect(wallet.balance.amount).toBe("2.00");
   });
 
-  test("reversing a BET credits the wallet", () => {
+  test("ROLLBACK debits a processed REFUND", () => {
     const wallet = Wallet.open("wallet-1", "USD");
-    const bet = create(WagerTransactionKind.BET, "bet-to-reverse");
-    const reversal = create(WagerTransactionKind.REVERSAL, "reversal-of-bet", bet.id);
-    expect(reversal.directionFor(bet)).toBe(TransactionDirection.CREDIT);
-    reversal.applyTo(wallet, bet);
+    wallet.credit(Money.from("4.00", "USD"));
+    const bet = create(WagerTransactionKind.BET, "bet-for-refund");
+    bet.markProcessed();
+    const refund = create(WagerTransactionKind.REFUND, "refund-for-rollback", bet.id);
+    refund.markProcessed();
+    const rollback = create(WagerTransactionKind.ROLLBACK, "rollback-refund", refund.id);
+    expect(rollback.directionFor(refund)).toBe(TransactionDirection.DEBIT);
+    rollback.applyTo(wallet, refund);
     expect(wallet.balance.amount).toBe("2.00");
   });
 
   test("rejects a reversal that would make the balance negative with a distinct code", () => {
     const wallet = Wallet.open("wallet-1", "USD");
     const win = create(WagerTransactionKind.WIN, "win-2");
-    const reversal = create(WagerTransactionKind.REVERSAL, "reversal-2", win.id);
-    reversal.applyTo(wallet, win);
-    expect(reversal.failureCode).toBe(FailureCode.REVERSAL_WOULD_NEGATIVE_BALANCE);
+    win.markProcessed();
+    const rollback = create(WagerTransactionKind.ROLLBACK, "rollback-2", win.id);
+    rollback.applyTo(wallet, win);
+    expect(rollback.failureCode).toBe(FailureCode.ROLLBACK_WOULD_NEGATIVE_BALANCE);
   });
 
   test("requires an existing reference and rejects payload changes for a reused key", () => {
-    const reversal = create(WagerTransactionKind.REVERSAL, "reversal-3", "missing");
-    expect(() => reversal.directionFor()).toThrow(ReferencedTransactionNotFoundError);
+    const rollback = create(WagerTransactionKind.ROLLBACK, "rollback-3", "missing");
+    expect(() => rollback.directionFor()).toThrow(ReferencedTransactionNotFoundError);
 
     const bet = create(WagerTransactionKind.BET, "bet-1");
     expect(() =>
@@ -145,5 +148,14 @@ describe("wager transaction kind rules", () => {
     transaction.markProcessed();
     expect(() => transaction.fail(FailureCode.INVALID_AMOUNT)).toThrow();
     expect(() => transaction.markProcessed()).toThrow();
+  });
+
+  test("PENDING_REFERENCE may be resolved but cannot transition twice into itself", () => {
+    const transaction = create(WagerTransactionKind.REFUND, "pending-reference", "bet-reference");
+    transaction.markPendingReference();
+    expect(transaction.status).toBe(WagerTransactionStatus.PENDING_REFERENCE);
+    transaction.markProcessed();
+    expect(transaction.status).toBe(WagerTransactionStatus.PROCESSED);
+    expect(() => transaction.markPendingReference()).toThrow();
   });
 });

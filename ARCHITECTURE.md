@@ -54,61 +54,71 @@ metadata (idempotency header, correlation ID, SQS message ID) are excluded.
 Same identity and hash returns the original result with
 `idempotentReplay: true`; a different hash is an idempotency conflict.
 
+Wallet creation accepts an optional `initialBalance` (default `0.00`). For a
+positive opening balance, one PostgreSQL transaction inserts the wallet, an
+internal `OPENING` transaction in `PROCESSED`, its `CREDIT` ledger entry from
+`0.00` to the opening balance, and a `WALLET_OPENED` outbox event. A zero-balance
+wallet needs no opening transaction or ledger row. `OPENING` is an internal
+kind: `SubmitWagerTransaction` rejects it from both HTTP and SQS payloads.
+
 ## Transaction states and failure codes
 
-The HTTP/use-case kinds are `BET`, `WIN`, `REFUND`, and `ROLLBACK`. `BET` and
-`ROLLBACK` debit; `WIN` and `REFUND` credit. The domain also declares
-`REVERSAL`, but the submission use case does not accept it. A `REFUND` must
-reference a processed `BET`; a `ROLLBACK` must reference a processed `REFUND`.
-The reference must match provider, player, wallet, currency, round, and amount.
-A missing or not-yet-processed reference is persisted as `PENDING_REFERENCE`.
-Duplicate reversals and invalid references are rejected without a ledger row.
+The provider-facing kinds are `BET`, `WIN`, `REFUND`, and `ROLLBACK`.
+`OPENING` is reserved for internal wallet initialization. `BET` debits and
+`WIN` credits. A `REFUND` references a processed `BET` and credits. A
+`ROLLBACK` references a processed `BET`, `WIN`, or `REFUND` and applies its
+inverse: it credits for a `BET` reference and debits for `WIN` or `REFUND`.
+References must match provider, player, wallet, currency, round, and amount.
+The database prevents a reference from being reversed more than once by the
+same transaction kind; rejected attempts do not reserve the reference. A
+missing or not-yet-processed reference is persisted as `PENDING_REFERENCE`.
+Invalid references and duplicate reversals are rejected without a ledger row.
 
-The domain aggregate permits only these transitions:
+The domain aggregate permits these transitions:
 
 | From | To | Domain operation |
 |---|---|---|
 | `PENDING` | `PROCESSED` | `markProcessed()` |
 | `PENDING` | `REJECTED` | `reject(failureCode)` |
 | `PENDING` | `FAILED` | `fail(failureCode)` |
+| `PENDING` | `PENDING_REFERENCE` | `markPendingReference()` |
+| `PENDING_REFERENCE` | `PROCESSED` | `markProcessed()` |
+| `PENDING_REFERENCE` | `REJECTED` | `reject(failureCode)` |
+| `PENDING_REFERENCE` | `FAILED` | `fail(failureCode)` |
 
 `PROCESSED`, `REJECTED`, and `FAILED` are terminal. `PENDING` and
-`PENDING_REFERENCE` are non-terminal persisted statuses. `PENDING_REFERENCE`
-is managed by the application/store retry workflow rather than a transition
-method on the domain aggregate; a retry may process it or reject it after the
-reference arrives or the retry limit is exhausted. A successful financial
-mutation creates one immutable ledger entry and its event in the outbox in the
-same commit. Rejections do not create a ledger entry.
+`PENDING_REFERENCE` are non-terminal. A retry may process a pending reference
+or reject it after the reference arrives or the retry limit is exhausted. A
+successful financial mutation creates one immutable ledger entry and its event
+in the outbox in the same commit. Rejections do not create a ledger entry.
 
 All `FailureCode` values declared in `src/domain/failure-code.ts` are listed
-below. The application currently emits the specifically noted codes; generic
-and legacy codes remain available to domain operations and are not necessarily
-returned by the HTTP submission path.
+below. Some are domain-level errors and are not necessarily persisted or
+returned by the HTTP submission path; provider actions describe how to respond
+if that code is surfaced.
 
 | Code | Meaning and provider action |
 |---|---|
-| `INSUFFICIENT_BALANCE` | Generic domain debit failure. Do not retry unchanged; resolve the balance/business condition and use a new transaction identity. |
-| `INSUFFICIENT_BALANCE_FOR_BET` | BET exceeds available balance. Do not retry unchanged; resolve funds and submit as a new transaction. |
-| `INSUFFICIENT_BALANCE_FOR_ROLLBACK` | Generic domain rollback debit failure. Do not retry unchanged; reconcile the reversal and submit a corrected transaction with a new identity if appropriate. |
-| `REVERSAL_WOULD_NEGATIVE_BALANCE` | Generic/legacy reversal would overdraw. Do not retry unchanged; reconcile and correct the reversal. |
-| `ROLLBACK_WOULD_NEGATIVE_BALANCE` | ROLLBACK would overdraw. Do not retry unchanged; reconcile the refund/reference and submit a corrected new transaction if appropriate. |
-| `WALLET_BALANCE_LIMIT_EXCEEDED` | Credit exceeds the supported NUMERIC balance range. Correct the business amount or wallet handling; do not retry unchanged. |
-| `REFERENCED_TRANSACTION_NOT_FOUND` | Reference did not arrive before the pending retry limit. Check provider history; do not resend the identical transaction, and correct the reference/use a new identity if resubmission is needed. |
-| `INVALID_REVERSAL_REFERENCE` | Domain reference kind is invalid. Correct the referenced transaction and use a new transaction identity. |
-| `INVALID_REFERENCE_TYPE` | REFUND/ROLLBACK references the wrong kind. Correct the reference and use a new identity. |
-| `REFERENCE_PAYLOAD_MISMATCH` | Referenced amount differs. Correct the amount/reference and use a new identity. |
+| `INSUFFICIENT_BALANCE` | Generic domain debit error. Resolve the balance condition; do not retry unchanged. |
+| `INSUFFICIENT_BALANCE_FOR_BET` | BET exceeds available balance. Resolve funds and submit a new business transaction; do not retry unchanged. |
+| `ROLLBACK_WOULD_NEGATIVE_BALANCE` | Applying a ROLLBACK would overdraw. Reconcile the reference and balance, then correct the reversal; do not retry unchanged. |
+| `WALLET_BALANCE_LIMIT_EXCEEDED` | Credit exceeds the supported NUMERIC balance range. Correct the amount/business handling; do not retry unchanged. |
+| `REFERENCED_TRANSACTION_NOT_FOUND` | Reference did not arrive before retry exhaustion. Check provider history; use a corrected reference and new transaction identity if resubmitting. |
+| `INVALID_REVERSAL_REFERENCE` | Domain operation received a wrong-kind or non-processed reference. Correct the reference and use a new transaction identity. |
+| `INVALID_REFERENCE_TYPE` | REFUND/ROLLBACK references a disallowed kind. Correct the reference and use a new identity. |
+| `REFERENCE_PAYLOAD_MISMATCH` | Reference amount differs. Correct the amount/reference and use a new identity. |
 | `REFERENCE_PROVIDER_MISMATCH` | Reference belongs to another provider. Correct provider/reference and use a new identity. |
 | `REFERENCE_PLAYER_MISMATCH` | Reference belongs to another player. Correct player/reference and use a new identity. |
 | `REFERENCE_WALLET_MISMATCH` | Reference belongs to another wallet. Correct wallet/reference and use a new identity. |
-| `WALLET_CURRENCY_MISMATCH` | Wallet/reference currency differs from the request. Correct the currency or wallet selection and use a new identity. |
+| `WALLET_CURRENCY_MISMATCH` | Wallet/reference currency differs from the request. Correct the currency or wallet and use a new identity. |
 | `ROUND_MISMATCH` | Reference round differs. Correct the round/reference and use a new identity. |
-| `DUPLICATE_REVERSAL` | Reference already has a reversal. Do not retry; stop and reconcile. |
-| `WALLET_NOT_FOUND` | Wallet is absent. Correct provisioning or wallet ID; then submit with a new identity. |
+| `DUPLICATE_REVERSAL` | A reversal of this kind already exists for the reference. Do not retry; reconcile and stop. |
+| `WALLET_NOT_FOUND` | Wallet is absent. Provision or correct the wallet ID, then submit with a new identity. |
 | `WALLET_PLAYER_MISMATCH` | Wallet does not belong to the supplied player. Correct player/wallet and use a new identity. |
-| `CURRENCY_MISMATCH` | Generic domain Money currency mismatch. Correct the currency data; do not retry unchanged. |
-| `INVALID_AMOUNT` | Domain amount is invalid. Correct the amount and request. |
-| `INVALID_TRANSACTION_STATE` | A terminal/non-pending domain transaction was transitioned. Do not retry unchanged; reconcile transaction state. |
-| `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | A persisted identity/key was reused with a different payload. This is a `409`: inspect the original result, do not change-and-retry under that identity. |
+| `CURRENCY_MISMATCH` | Domain Money arithmetic received different currencies. Correct the currency data; do not retry unchanged. |
+| `INVALID_AMOUNT` | Amount is invalid. Correct the amount and request. |
+| `INVALID_TRANSACTION_STATE` | A terminal/non-pending transaction was transitioned. Reconcile state; do not retry unchanged. |
+| `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | A persisted identity/key was reused with a different payload. Inspect the original result; do not change payload under that identity (`409`). |
 
 The use case returns `503` for recognized transient persistence failures; the
 provider should retry the same identity and payload. Missing references return
@@ -131,11 +141,15 @@ unchanged. The ledger `limit` defaults to 50 and accepts only decimal integer
 values from 1 through 100. Invalid limits and malformed cursors return `400`
 with `{ code: "INVALID_QUERY", message }`.
 
-The `AuthGuard` is deliberately a no-op extension point because no provider
-credential format or authorization policy is specified. It is not
-authentication. Health endpoints remain unauthenticated; production deployment
-must wire and document the chosen provider authentication and wallet/provider
-authorization rules before exposure.
+The current `AuthGuard` is a no-op extension point, not authentication.
+Health endpoints remain unauthenticated. For deployment, the adopted target
+design is OIDC with Keycloak or an equivalent identity provider, issuing a
+separate credential/client identity per wagering provider. The guard should
+validate the token signature, issuer, audience, expiry, and provider identity,
+then require the `providerId` in the request body to equal the authenticated
+provider claim. Wallet/player authorization must also be enforced before
+exposure; this authentication policy is a design choice, not implemented
+behavior today.
 
 Reconciliation locks the wallet row while comparing its stored balance with
 the signed sum of ledger amounts. It reports `consistent: false`, logs a
@@ -190,6 +204,4 @@ compares every wallet balance with the signed ledger reconstruction.
 
 The SQS transient-retry test injects a transient error at the use-case boundary;
 it does not simulate PostgreSQL being offline. There is no load/performance
-test. The ledger starts from zero and has no opening-balance/bootstrap entry,
-so reconciliation is meaningful only for wallets whose entire balance history
-is represented by ledger rows.
+test.

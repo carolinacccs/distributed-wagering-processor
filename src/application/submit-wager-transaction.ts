@@ -157,11 +157,13 @@ function validateReference(
   data: SubmitWagerData,
   reference: WagerReference,
 ): FailureCode | null {
-  const expectedKind =
+  const validKind =
     data.kind === WagerTransactionKind.REFUND
-      ? WagerTransactionKind.BET
-      : WagerTransactionKind.REFUND;
-  if (reference.kind !== expectedKind) {
+      ? reference.kind === WagerTransactionKind.BET
+      : reference.kind === WagerTransactionKind.BET ||
+        reference.kind === WagerTransactionKind.WIN ||
+        reference.kind === WagerTransactionKind.REFUND;
+  if (!validKind) {
     return FailureCode.INVALID_REFERENCE_TYPE;
   }
   if (reference.providerId !== data.providerId) {
@@ -333,7 +335,7 @@ export class SubmitWagerTransaction {
           if (reference.status !== WagerTransactionStatus.PROCESSED) {
             return this.pendingReference(session, currentData, wallet.balance.amount, reference.id);
           }
-          if (await session.hasReversal(reference.id)) {
+          if (await session.hasReversal(reference.id, currentData.kind)) {
             return this.reject(
               session,
               currentData,
@@ -346,10 +348,13 @@ export class SubmitWagerTransaction {
 
         const before = wallet.balance;
         const direction =
-          currentData.kind === WagerTransactionKind.BET ||
-          currentData.kind === WagerTransactionKind.ROLLBACK
+          currentData.kind === WagerTransactionKind.BET
             ? TransactionDirection.DEBIT
-            : TransactionDirection.CREDIT;
+            : currentData.kind === WagerTransactionKind.ROLLBACK
+              ? reference?.kind === WagerTransactionKind.BET
+                ? TransactionDirection.CREDIT
+                : TransactionDirection.DEBIT
+              : TransactionDirection.CREDIT;
 
         if (direction === TransactionDirection.CREDIT) {
           const maximumBalance = Money.from("99999999999999999.99", before.currency);
@@ -424,7 +429,6 @@ export class SubmitWagerTransaction {
                 occurredAt,
               );
             case WagerTransactionKind.ROLLBACK:
-            case WagerTransactionKind.REVERSAL:
               return WagerReversedEvent.create(
                 eventId,
                 transactionId,
@@ -432,6 +436,8 @@ export class SubmitWagerTransaction {
                 currentData.amount,
                 occurredAt,
               );
+            case WagerTransactionKind.OPENING:
+              throw new Error("OPENING transactions cannot be submitted through wagering.");
           }
         })();
         await session.appendOutbox(

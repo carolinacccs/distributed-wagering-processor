@@ -15,7 +15,7 @@ export enum WagerTransactionKind {
   WIN = "WIN",
   REFUND = "REFUND",
   ROLLBACK = "ROLLBACK",
-  REVERSAL = "REVERSAL",
+  OPENING = "OPENING",
 }
 
 export enum WagerTransactionStatus {
@@ -87,6 +87,8 @@ export class WagerTransaction {
     if (
       !Object.values(WagerTransactionStatus).includes(data.status) ||
       (data.status === WagerTransactionStatus.PENDING && data.failureCode !== undefined) ||
+      (data.status === WagerTransactionStatus.PENDING_REFERENCE &&
+        data.failureCode !== undefined) ||
       (data.status === WagerTransactionStatus.PROCESSED && data.failureCode !== undefined) ||
       ((data.status === WagerTransactionStatus.REJECTED ||
         data.status === WagerTransactionStatus.FAILED) &&
@@ -124,19 +126,14 @@ export class WagerTransaction {
         if (!reference || reference.id !== this.referenceId) {
           throw new ReferencedTransactionNotFoundError(this.referenceId ?? "");
         }
-        if (reference.kind !== WagerTransactionKind.BET) {
+        if (
+          reference.kind !== WagerTransactionKind.BET ||
+          reference.status !== WagerTransactionStatus.PROCESSED
+        ) {
           throw new InvalidReversalReferenceError();
         }
         return TransactionDirection.CREDIT;
       case WagerTransactionKind.ROLLBACK:
-        if (!reference || reference.id !== this.referenceId) {
-          throw new ReferencedTransactionNotFoundError(this.referenceId ?? "");
-        }
-        if (reference.kind !== WagerTransactionKind.REFUND) {
-          throw new InvalidReversalReferenceError();
-        }
-        return TransactionDirection.DEBIT;
-      case WagerTransactionKind.REVERSAL:
         if (!reference || reference.id !== this.referenceId) {
           throw new ReferencedTransactionNotFoundError(this.referenceId ?? "");
         }
@@ -147,9 +144,14 @@ export class WagerTransaction {
         ) {
           throw new InvalidReversalReferenceError();
         }
+        if (reference.status !== WagerTransactionStatus.PROCESSED) {
+          throw new InvalidReversalReferenceError();
+        }
         return reference.kind === WagerTransactionKind.BET
           ? TransactionDirection.CREDIT
           : TransactionDirection.DEBIT;
+      case WagerTransactionKind.OPENING:
+        return TransactionDirection.CREDIT;
     }
   }
 
@@ -168,10 +170,8 @@ export class WagerTransaction {
       wallet.debit(
         this.amount,
         this.kind === WagerTransactionKind.ROLLBACK
-          ? FailureCode.INSUFFICIENT_BALANCE_FOR_ROLLBACK
-          : this.kind === WagerTransactionKind.REVERSAL
-            ? FailureCode.REVERSAL_WOULD_NEGATIVE_BALANCE
-            : FailureCode.INSUFFICIENT_BALANCE_FOR_BET,
+          ? FailureCode.ROLLBACK_WOULD_NEGATIVE_BALANCE
+          : FailureCode.INSUFFICIENT_BALANCE_FOR_BET,
       );
     } catch (error) {
       if (error instanceof InsufficientBalanceError) {
@@ -184,6 +184,10 @@ export class WagerTransaction {
 
   markProcessed(): void {
     this.transition(WagerTransactionStatus.PROCESSED);
+  }
+
+  markPendingReference(): void {
+    this.transition(WagerTransactionStatus.PENDING_REFERENCE);
   }
 
   reject(code: FailureCode): void {
@@ -212,10 +216,13 @@ export class WagerTransaction {
     this.assertPending();
     if (
       !Object.values(WagerTransactionStatus).includes(status) ||
+      (this.currentStatus === WagerTransactionStatus.PENDING_REFERENCE &&
+        status === WagerTransactionStatus.PENDING_REFERENCE) ||
       (status === WagerTransactionStatus.REJECTED && !code) ||
       (status === WagerTransactionStatus.FAILED && !code) ||
       ((status === WagerTransactionStatus.PROCESSED ||
-        status === WagerTransactionStatus.PENDING) &&
+        status === WagerTransactionStatus.PENDING ||
+        status === WagerTransactionStatus.PENDING_REFERENCE) &&
         code !== undefined) ||
       (code !== undefined && !Object.values(FailureCode).includes(code))
     ) {
@@ -226,7 +233,10 @@ export class WagerTransaction {
   }
 
   private assertPending(): void {
-    if (this.currentStatus !== WagerTransactionStatus.PENDING) {
+    if (
+      this.currentStatus !== WagerTransactionStatus.PENDING &&
+      this.currentStatus !== WagerTransactionStatus.PENDING_REFERENCE
+    ) {
       throw new InvalidTransactionStateError(this.currentStatus);
     }
   }
@@ -241,8 +251,7 @@ export class WagerTransaction {
       throw new TypeError("Invalid wager transaction payload.");
     }
     if (
-      (payload.kind === WagerTransactionKind.REVERSAL ||
-        payload.kind === WagerTransactionKind.ROLLBACK ||
+      (payload.kind === WagerTransactionKind.ROLLBACK ||
         payload.kind === WagerTransactionKind.REFUND) &&
       !payload.referenceId?.trim()
     ) {

@@ -189,15 +189,15 @@ export class MikroOrmWageringStore implements WageringStore {
           return reference;
         },
 
-        hasReversal: async (referenceId: string) => {
+        hasReversal: async (referenceId: string, kind: WagerTransactionKind) => {
           const rows = await query<{ exists: boolean }>(
             `select exists(
                select 1 from "wager_transactions"
                where "reference_id" = ?
-                 and "kind" in ('REFUND', 'ROLLBACK')
+                 and "kind" = ?
                  and "status" <> 'REJECTED'
              ) as "exists"`,
-            [referenceId],
+            [referenceId, kind],
           );
           return rows[0]?.exists ?? false;
         },

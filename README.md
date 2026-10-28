@@ -62,7 +62,7 @@ All wagering payloads require `providerId`, `playerId`, `walletId`,
 
 | Method and path | Purpose |
 |---|---|
-| `POST /wallets` | Open a zero-balance wallet for a player and currency |
+| `POST /wallets` | Open a wallet for a player and currency; optional `initialBalance` is recorded as an internal `OPENING` transaction |
 | `GET /wallets/:walletId` | Read a wallet |
 | `GET /wallets/:walletId/ledger?cursor=&limit=50` | Read ledger entries in stable keyset order |
 | `POST /wallets/:walletId/reconciliation` | Compare stored balance with the ledger sum |

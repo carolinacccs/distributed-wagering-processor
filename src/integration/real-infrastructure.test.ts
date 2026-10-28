@@ -215,6 +215,133 @@ describeIntegration("real PostgreSQL, SQS, and multiple application processes", 
     }
   });
 
+  test("wallet opening balance creates a processed OPENING, ledger credit, and reconciles", async () => {
+    const wallet = await createWallet("player-opening", "USD", "25.50");
+    expect(wallet.balance).toBe("25.50");
+    const { rows } = await pool.query(
+      `select transaction."kind", transaction."status", ledger."direction",
+              ledger."balance_before"::text as "balance_before",
+              ledger."balance_after"::text as "balance_after"
+       from "wallet_ledger_entries" ledger
+       join "wager_transactions" transaction on transaction."id" = ledger."transaction_id"
+       where ledger."wallet_id" = $1`,
+      [wallet.id],
+    );
+    expect(rows).toEqual([
+      {
+        kind: "OPENING",
+        status: "PROCESSED",
+        direction: "CREDIT",
+        balance_before: "0.00",
+        balance_after: "25.50",
+      },
+    ]);
+    const reconciliation = await fetch(
+      `${API_URLS[0]}/wallets/${wallet.id}/reconciliation`,
+      { method: "POST" },
+    );
+    expect(reconciliation.status).toBe(201);
+    expect(await reconciliation.json()).toMatchObject({
+      walletId: wallet.id,
+      storedBalance: "25.50",
+      calculatedBalance: "25.50",
+      difference: "0.00",
+      consistent: true,
+      checkedEntries: 1,
+    });
+    const eventRows = await pool.query(
+      `select count(*)::int as count from "outbox_messages"
+       where "event_type" = 'WALLET_OPENED'
+         and "body"::jsonb->>'walletId' = $1`,
+      [wallet.id],
+    );
+    expect(eventRows.rows[0]?.count).toBe(1);
+  });
+
+  test("ROLLBACK of a BET credits once and rejects a duplicate same-kind reversal", async () => {
+    const wallet = await createWallet("player-rollback-bet", "USD", "10.00");
+    const bet = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-bet-target",
+      amount: "3.00",
+    });
+    expect(bet.status).toBe("PROCESSED");
+    const rollback = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-bet",
+      kind: WagerTransactionKind.ROLLBACK,
+      amount: "3.00",
+      referenceExternalTransactionId: "rollback-bet-target",
+    });
+    expect(rollback.status).toBe("PROCESSED");
+    expect((await walletById(wallet.id)).balance).toBe("10.00");
+    const duplicate = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-bet-duplicate",
+      kind: WagerTransactionKind.ROLLBACK,
+      amount: "3.00",
+      referenceExternalTransactionId: "rollback-bet-target",
+    });
+    expect(duplicate.status).toBe("REJECTED");
+    expect(duplicate.failureCode).toBe("DUPLICATE_REVERSAL");
+    expect((await walletById(wallet.id)).balance).toBe("10.00");
+  });
+
+  test("ROLLBACK of a WIN debits", async () => {
+    const wallet = await createWallet("player-rollback-win", "USD", "10.00");
+    const win = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-win-target",
+      kind: WagerTransactionKind.WIN,
+      amount: "3.00",
+    });
+    expect(win.status).toBe("PROCESSED");
+    const rollback = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-win",
+      kind: WagerTransactionKind.ROLLBACK,
+      amount: "3.00",
+      referenceExternalTransactionId: "rollback-win-target",
+    });
+    expect(rollback.status).toBe("PROCESSED");
+    expect((await walletById(wallet.id)).balance).toBe("10.00");
+  });
+
+  test("ROLLBACK of a REFUND debits", async () => {
+    const wallet = await createWallet("player-rollback-refund", "USD", "10.00");
+    const bet = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-refund-bet",
+      amount: "3.00",
+    });
+    expect(bet.status).toBe("PROCESSED");
+    const refund = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-refund-target",
+      kind: WagerTransactionKind.REFUND,
+      amount: "3.00",
+      referenceExternalTransactionId: "rollback-refund-bet",
+    });
+    expect(refund.status).toBe("PROCESSED");
+    const rollback = await submit({
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      externalTransactionId: "rollback-refund",
+      kind: WagerTransactionKind.ROLLBACK,
+      amount: "3.00",
+      referenceExternalTransactionId: "rollback-refund-target",
+    });
+    expect(rollback.status).toBe("PROCESSED");
+    expect((await walletById(wallet.id)).balance).toBe("7.00");
+  });
+
   test("PostgreSQL enforces balance, uniqueness, and ledger immutability constraints", async () => {
     const wallet = await createWallet("player-schema-constraints", "USD");
     const funded = await submit({
@@ -402,6 +529,35 @@ describeIntegration("real PostgreSQL, SQS, and multiple application processes", 
         () => isQueueEmpty(wagerQueueUrl),
         15_000,
         "malformed SQS message acknowledgement",
+      );
+
+      const openingSubmission = {
+        providerId: "provider-it",
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        externalTransactionId: "opening-must-be-internal",
+        idempotencyKey: "opening-must-be-internal-key",
+        kind: WagerTransactionKind.OPENING,
+        amount: "1.00",
+        currency: wallet.currency,
+        roundId: "opening",
+      };
+      const apiResponse = await fetch(`${API_URLS[0]}/wagering/transactions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": openingSubmission.idempotencyKey,
+        },
+        body: JSON.stringify(openingSubmission),
+      });
+      expect(apiResponse.status).toBe(400);
+      await enqueueWager(openingSubmission);
+      const openingDeadLetter = await receiveDeadLetter("INVALID_PAYLOAD", 45_000);
+      expect(typeof openingDeadLetter.originalMessageId).toBe("string");
+      await waitUntil(
+        () => isQueueEmpty(wagerQueueUrl),
+        15_000,
+        "internal OPENING wager message acknowledgement",
       );
 
       await enqueueWager({
@@ -684,11 +840,15 @@ async function stopApis(): Promise<void> {
   );
 }
 
-async function createWallet(playerId: string, currency: string): Promise<WalletResponse> {
+async function createWallet(
+  playerId: string,
+  currency: string,
+  initialBalance?: string,
+): Promise<WalletResponse> {
   const response = await fetch(`${API_URLS[0]}/wallets`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ playerId, currency }),
+    body: JSON.stringify({ playerId, currency, ...(initialBalance ? { initialBalance } : {}) }),
   });
   expect(response.status).toBe(201);
   return (await response.json()) as WalletResponse;

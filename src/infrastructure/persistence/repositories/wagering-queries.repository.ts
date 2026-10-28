@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EntityManager } from "@mikro-orm/postgresql";
 import Decimal from "decimal.js";
 import { logger } from "../../observability/logger";
@@ -7,6 +7,9 @@ import {
   reconciliationDivergenceCounter,
 } from "../../observability/metrics";
 import { Money } from "../../../domain/money";
+import { TransactionDirection, WagerTransaction, WagerTransactionKind } from "../../../domain/wager-transaction";
+import { WalletLedgerEntry } from "../../../domain/wallet-ledger-entry";
+import { WalletOpenedEvent } from "../../../domain/integration-events";
 
 export interface WalletView {
   readonly id: string;
@@ -66,24 +69,141 @@ function walletView(row: WalletRow): WalletView {
 export class WageringQueriesRepository {
   constructor(private readonly entityManager: EntityManager) {}
 
-  async createWallet(playerId: string, currency: string): Promise<WalletView> {
+  async createWallet(
+    playerId: string,
+    currency: string,
+    initialBalance = "0.00",
+  ): Promise<WalletView> {
     if (!playerId.trim() || !/^[A-Z]{3}$/.test(currency)) {
       throw new TypeError("Player id and ISO currency are required.");
     }
-    const id = randomUUID();
-    const rows = await this.entityManager.getConnection().execute<WalletRow[]>(
-      `insert into "wallets" ("id", "player_id", "currency", "balance", "version")
-       values (?, ?, ?, ?, 0)
-       returning "id", "player_id", "currency", "balance"::text as "balance",
-                 "version", "created_at"`,
-      [id, playerId, currency, Money.zero(currency).amount],
-      "all",
-    ) as WalletRow[];
-    const row = rows[0];
-    if (!row) {
-      throw new Error("Wallet insert did not return a row.");
+    const openingBalance = Money.from(initialBalance, currency);
+    if (openingBalance.amount.indexOf(".") > 17) {
+      throw new TypeError("Initial balance must fit NUMERIC(19,2).");
     }
-    return walletView(row);
+    const walletId = randomUUID();
+
+    return this.entityManager.transactional(async (em) => {
+      const connection = em.getConnection();
+      const context = em.getTransactionContext();
+      const rows = await connection.execute<WalletRow[]>(
+        `insert into "wallets" ("id", "player_id", "currency", "balance", "version")
+         values (?, ?, ?, ?, ?)
+         returning "id", "player_id", "currency", "balance"::text as "balance",
+                   "version", "created_at"`,
+        [
+          walletId,
+          playerId,
+          currency,
+          openingBalance.amount,
+          openingBalance.isZero() ? 0 : 1,
+        ],
+        "all",
+        context,
+      ) as WalletRow[];
+      const row = rows[0];
+      if (!row) {
+        throw new Error("Wallet insert did not return a row.");
+      }
+
+      if (!openingBalance.isZero()) {
+        const transactionId = randomUUID();
+        const eventId = randomUUID();
+        const idempotencyKey = `opening:${walletId}`;
+        const opening = WagerTransaction.create({
+          id: transactionId,
+          walletId,
+          kind: WagerTransactionKind.OPENING,
+          amount: openingBalance,
+          idempotencyKey,
+        });
+        opening.markProcessed();
+        const payloadHash = createHash("sha256")
+          .update(JSON.stringify({ walletId, amount: openingBalance.amount, currency }))
+          .digest("hex");
+        const occurredAt = new Date().toISOString();
+        const event = WalletOpenedEvent.create(
+          eventId,
+          transactionId,
+          walletId,
+          openingBalance,
+          occurredAt,
+        );
+        const ledger = WalletLedgerEntry.create(
+          randomUUID(),
+          walletId,
+          transactionId,
+          TransactionDirection.CREDIT,
+          openingBalance,
+          Money.zero(currency),
+          openingBalance,
+        );
+
+        await connection.execute(
+          `insert into "wager_transactions"
+            ("id", "wallet_id", "provider_id", "player_id", "external_transaction_id",
+             "idempotency_key", "kind", "status", "amount", "currency", "round_id",
+             "reference_external_transaction_id", "payload_hash", "response_balance")
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?)`,
+          [
+            transactionId,
+            walletId,
+            "internal",
+            playerId,
+            `opening:${walletId}`,
+            idempotencyKey,
+            opening.kind,
+            opening.status,
+            opening.amount.amount,
+            opening.amount.currency,
+            "opening",
+            payloadHash,
+            openingBalance.amount,
+          ],
+          "run",
+          context,
+        );
+        await connection.execute(
+          `insert into "wallet_ledger_entries"
+            ("id", "wallet_id", "transaction_id", "direction", "amount", "currency",
+             "balance_before", "balance_after")
+           values (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            ledger.id,
+            ledger.walletId,
+            ledger.transactionId,
+            ledger.direction,
+            ledger.amount.amount,
+            ledger.amount.currency,
+            ledger.balanceBefore.amount,
+            ledger.balanceAfter.amount,
+          ],
+          "run",
+          context,
+        );
+        await connection.execute(
+          `insert into "outbox_messages" ("id", "message_id", "event_type", "body")
+           values (?, ?, ?, ?)`,
+          [
+            randomUUID(),
+            event.eventId,
+            event.type,
+            JSON.stringify({
+              type: event.type,
+              eventId: event.eventId,
+              occurredAt: event.occurredAt,
+              transactionId: event.transactionId,
+              walletId: event.walletId,
+              amount: event.amount.amount,
+              currency: event.amount.currency,
+            }),
+          ],
+          "run",
+          context,
+        );
+      }
+      return walletView(row);
+    });
   }
 
   async findWallet(walletId: string): Promise<WalletView | null> {
